@@ -1,4 +1,4 @@
-name: RSS Mailer (Outlook)
+name: RSS Mailer
 
 on:
   schedule:
@@ -10,9 +10,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
+      # ✅ 加在这里：缓存 Argos 翻译模型（避免每天重复下载）
+      - name: Cache Argos Translate models
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/argos-translate
+          key: argos-translate-en-zh-v1
 
       - name: Install dependencies
         run: pip install -r requirements.txt
