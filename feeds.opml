@@ -4,10 +4,6 @@
     <title>My Feeds</title>
   </head>
   <body>
-    <outline text="AI" title="AI">
-      <outline type="rss" text="BestBlogs.dev AI (1d)" title="BestBlogs.dev AI (1d)" xmlUrl="https://www.bestblogs.dev/feeds/rss?category=ai&amp;featured=y&amp;timeFilter=1d&amp;type=article"/>
-    </outline>
-
     <outline text="HN Popular Blogs 2025" title="HN Popular Blogs 2025">
       <outline text="Blogs" title="Blogs">
         <outline type="rss" text="simonwillison.net" title="simonwillison.net" xmlUrl="https://simonwillison.net/atom/everything/" htmlUrl="https://simonwillison.net"/>
