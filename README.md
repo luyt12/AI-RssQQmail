@@ -1,6 +1,6 @@
-# Rss-to-qq-email（GitHub Actions）
+# Rss-to-QQemail（GitHub Actions）
 
-定时从 OPML（RSS 订阅列表）抓取最近内容，并通过 SMTP 发送到邮箱。默认配置为：**每天北京时间 09:00** 运行一次。
+定时从 OPML（RSS 订阅列表）抓取最近内容，并通过 SMTP 发送到邮箱。支持把邮件内容做成 **中英文对照：中文（英文）**。默认配置为：**每天北京时间 09:00** 运行一次。
 
 ## 功能
 
@@ -8,6 +8,7 @@
 - 抓取最近 **24 小时**的新文章，汇总成一封邮件（HTML）
 - 对每个订阅源设置超时（避免卡住）；抓取失败会跳过并在邮件末尾列出失败列表
 - 通过 SMTP 发信（支持 `465/SMTP_SSL` 与 `587/STARTTLS`）
+- 离线翻译：使用 **Argos Translate** 把站点名/标题等翻译为中文，并输出 **中英文对照**（无需任何 API Key）
 
 ## 订阅源（OPML）
 
@@ -48,6 +49,32 @@ QQ 邮箱网页版 → 设置 → 账户 → 开启 **SMTP 服务** → 生成 *
 
 > 如果你用的是其他邮箱：把 `SMTP_HOST/SMTP_PORT` 换成对应服务商的值即可（465=SSL，587=STARTTLS）。
 
+## 中英文对照翻译（无需 Key）
+
+本项目使用 **Argos Translate**（离线翻译）生成中英文对照（中文（英文））。首次运行会自动下载英语→中文模型（几十 MB），可能会慢 1–3 分钟；后续会通过 GitHub Actions cache 变快。
+
+### requirements.txt
+
+确保包含：
+
+```txt
+feedparser==6.0.11
+python-dateutil==2.9.0.post0
+argostranslate==1.9.6
+```
+
+### 工作流缓存（强烈推荐）
+
+在 `.github/workflows/rss_mailer.yml` 的 `actions/setup-python` 后、`Install dependencies` 前加入：
+
+```yaml
+- name: Cache Argos Translate models
+  uses: actions/cache@v4
+  with:
+    path: ~/.local/share/argos-translate
+    key: argos-translate-en-zh-v1
+```
+
 ## 定时运行（每天早上 9 点）
 
 工作流文件：`.github/workflows/rss_mailer.yml`
@@ -69,6 +96,32 @@ GitHub Actions 的 cron 使用 **UTC** 时区（不是北京时间）。
 
 运行成功后检查收件邮箱是否收到 “每日 RSS 摘要”。
 
+## 自定义
+
+### 修改订阅源
+
+编辑 `rss_mailer.py`：
+- `OPML_URL`：替换为你的 OPML raw 链接
+
+### 修改抓取窗口（默认最近 24 小时）
+
+编辑 `rss_mailer.py`：
+- `LOOKBACK_HOURS = 24`
+
+### 修改运行时间（北京时间）
+
+编辑 `.github/workflows/rss_mailer.yml` 的 cron（注意要换算成 UTC）：
+- 北京时间 09:00 = UTC 01:00 → `0 1 * * *`
+- 北京时间 08:00 = UTC 00:00 → `0 0 * * *`
+
+### 邮件主题
+
+工作流里可改：
+
+```yaml
+EMAIL_SUBJECT: "每日 RSS 摘要"
+```
+
 ## 常见问题
 
 1. **部分订阅源 403/超时**
@@ -80,4 +133,3 @@ GitHub Actions 的 cron 使用 **UTC** 时区（不是北京时间）。
 
 3. **定时触发有延迟**
    - GitHub 定时任务可能延迟几分钟，属于正常情况。
-
