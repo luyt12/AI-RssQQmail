@@ -15,7 +15,6 @@
 
 当前 `feeds.opml` 已包含：
 - HN Popular Blogs 2025（博客合集）
-- BestBlogs.dev AI（最近 1 天文章）
 
 ## 文件结构
 
