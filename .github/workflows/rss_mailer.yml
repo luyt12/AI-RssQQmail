@@ -2,7 +2,7 @@ name: RSS Mailer
 
 on:
   schedule:
-    - cron: "0 1 * * *"  # UTC 01:00 = 北京时间 09:00
+    - cron: "0 1 * * *"  # UTC 01:00 = Beijing 09:00
   workflow_dispatch:
 
 jobs:
@@ -15,7 +15,6 @@ jobs:
         with:
           python-version: "3.11"
 
-      # ✅ 加在这里：缓存 Argos 翻译模型（避免每天重复下载）
       - name: Cache Argos Translate models
         uses: actions/cache@v4
         with:
@@ -32,5 +31,5 @@ jobs:
           EMAIL_USER: ${{ secrets.EMAIL_USER }}
           EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
-          EMAIL_SUBJECT: "每日 RSS 摘要"
+          EMAIL_SUBJECT: "Daily RSS Digest"
         run: python rss_mailer.py
