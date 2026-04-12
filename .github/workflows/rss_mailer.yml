@@ -24,7 +24,13 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt 2>&1
 
-      - name: Run
+      - name: Check Python
+        run: |
+          set -x
+          python --version
+          python -c "import sys; print(sys.version)"
+
+      - name: Run RSS Mailer
         env:
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
@@ -33,5 +39,6 @@ jobs:
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
           EMAIL_SUBJECT: "Daily RSS Digest"
         run: |
-          python -c "import sys; print('Python:', sys.version); import argostranslate; print('Argos OK')" 2>&1 || echo "IMPORT_FAILED"
+          set -x
           python rss_mailer.py 2>&1
+          echo "Exit code: $?"
