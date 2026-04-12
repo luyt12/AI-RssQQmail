@@ -22,7 +22,7 @@ jobs:
           key: argos-translate-en-zh-v1
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r requirements.txt 2>&1
 
       - name: Run
         env:
@@ -32,4 +32,6 @@ jobs:
           EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
           EMAIL_SUBJECT: "Daily RSS Digest"
-        run: python rss_mailer.py
+        run: |
+          python -c "import sys; print('Python:', sys.version); import argostranslate; print('Argos OK')" 2>&1 || echo "IMPORT_FAILED"
+          python rss_mailer.py 2>&1
