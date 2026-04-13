@@ -16,9 +16,15 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Cache Argos Translate models
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/argos-translate
+          key: argos-translate-en-zh-v1
+
       - name: Install dependencies
         run: |
-          pip install feedparser python-dateutil
+          pip install feedparser python-dateutil argostranslate
 
       - name: Run RSS Mailer
         env:
