@@ -1,1 +1,297 @@
-"import os\nimport ssl\nimport smtplib\nimport feedparser\nimport xml.etree.ElementTree as ET\nimport re\nimport html\nimport ssl as ssl_module\nfrom datetime import datetime, timezone, timedelta\nfrom dateutil import parser as dtparser\nfrom urllib.request import urlopen, Request\nfrom email.mime.multipart import MIMEMultipart\nfrom email.mime.text import MIMEText\nfrom email.header import Header\n\nimport argostranslate.package\nimport argostranslate.translate\n\n\nOPML_PATH = \"feeds.opml\"\n\nFEED_TIMEOUT_SECONDS = 15\nARTICLE_TIMEOUT_SECONDS = 20\nPER_FEED_LIMIT = 10\nLOOKBACK_HOURS = 24\nTRANSLATE_SUMMARY_LEN = 300   # 摘要截断字数（中文字符）\n\n\n# ── Argos 翻译（离线缓存） ──────────────────────────────────────\n_translate_cache = {}\n\n\ndef ensure_argos_en_zh_installed():\n    try:\n        argostranslate.translate.get_translation_from_codes(\"en\", \"zh\")\n        return\n    except Exception:\n        pass\n    print(\"[INFO] 安装 Argos 离线翻译模型（en→zh），首次运行会下载，请稍等…\")\n    argostranslate.package.update_package_index()\n    available = argostranslate.package.get_available_packages()\n    pkg = next((p for p in available if p.from_code == \"en\" and p.to_code == \"zh\"), None)\n    if not pkg:\n        raise RuntimeError(\"未找到 Argos en→zh 翻译模型\")\n    argostranslate.package.install_from_path(pkg.download())\n    print(\"[INFO] Argos 翻译模型安装完成\")\n\n\ndef translate_en_to_zh(text: str) -> str:\n    \"\"\"英译中，带缓存。\"\"\"\n    text = (text or \"\").strip()\n    if not text:\n        return text\n    if text in _translate_cache:\n        return _translate_cache[text]\n    try:\n        zh = argostranslate.translate.get_translation_from_codes(\"en\", \"zh\").translate(text)\n    except Exception:\n        zh = text\n    _translate_cache[text] = zh\n    return zh\n\n\ndef _escape(s: str) -> str:\n    return (s or \"\").replace(\"&\", \"&amp;\").replace(\"<\", \"&lt;\").replace(\">\", \"&gt;\")\n\n\n# ── 文章全文抓取 + 纯文本提取 ───────────────────────────────────\ndef _strip_html_tags(text: str) -> str:\n    \"\"\"去掉 HTML 标签并解码实体字符。\"\"\"\n    text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL | re.IGNORECASE)\n    text = re.sub(r'<script[^>]*>.*?</script>', '', text, flags=re.DOTALL | re.IGNORECASE)\n    text = re.sub(r'<[^>]+>', ' ', text)\n    text = html.unescape(text)\n    text = re.sub(r'[ \\t]+', ' ', text)\n    text = re.sub(r'\\n\\s*\\n', '\\n\\n', text).strip()\n    return text\n\n\ndef fetch_article_text(url: str, timeout: int = ARTICLE_TIMEOUT_SECONDS) -> str:\n    \"\"\"\n    抓取网页，提取纯文本。失败返回空字符串（不阻断流程）。\n    \"\"\"\n    try:\n        req = Request(url, headers={\n            \"User-Agent\": \"Mozilla/5.0 (compatible; rss-mailer/1.0)\"\n        })\n        with urlopen(req, timeout=timeout) as r:\n            raw = r.read()\n        # 检测编码\n        text = raw.decode(\"utf-8\", errors=\"replace\")\n        return _strip_html_tags(text)[:5000]  # 最多取前 5000 字符防过大\n    except Exception as e:\n        print(f\"[WARN] fetch_article_text failed: {url} -> {e}\")\n        return \"\"\n\n\ndef summarize_by_translate(title: str, link: str) -> str:\n    \"\"\"\n    抓取文章全文，翻译成中文，截取前 TRANSLATE_SUMMARY_LEN 字作为摘要。\n    标题保留原文不翻译。\n    \"\"\"\n    article = fetch_article_text(link)\n    if not article:\n        return \"\"\n    zh = translate_en_to_zh(article)\n    # 按中文字符截断（避免切断单词）\n    if len(zh) <= TRANSLATE_SUMMARY_LEN:\n        return zh\n    # 找最后一个完整的句子断点\n    cut = zh[:TRANSLATE_SUMMARY_LEN]\n    last_punct = max(cut.rfind('。'), cut.rfind('！'), cut.rfind('？'),\n                     cut.rfind('；'), cut.rfind('，'))\n    if last_punct > TRANSLATE_SUMMARY_LEN * 0.6:\n        return cut[:last_punct + 1]\n    return cut + \"…\"\n\n\n# ── RSS 解析 ────────────────────────────────────────────────────\ndef load_feeds_from_opml_file(opml_path: str) -> list[str]:\n    with open(opml_path, \"r\", encoding=\"utf-8\") as f:\n        content = f.read().strip()\n    root = ET.fromstring(content)\n    seen = set()\n    out = []\n    for node in root.findall(\".//outline\"):\n        xml_url = node.attrib.get(\"xmlUrl\")\n        if xml_url and xml_url.strip() not in seen:\n            seen.add(xml_url.strip())\n            out.append(xml_url.strip())\n    return out\n\n\ndef safe_parse_feed(url: str, timeout: int):\n    try:\n        req = Request(url, headers={\"User-Agent\": \"rss-mailer/1.0\"})\n        with urlopen(req, timeout=timeout) as r:\n            data = r.read()\n        parsed = feedparser.parse(data)\n        if getattr(parsed, \"bozo\", 0):\n            ex = getattr(parsed, \"bozo_exception\", None)\n            if ex:\n                return parsed, f\"bozo_exception: {type(ex).__name__}: {ex}\"\n        return parsed, None\n    except Exception as e:\n        return None, f\"{type(e).__name__}: {e}\"\n\n\ndef entry_time_utc(entry) -> datetime | None:\n    for k in (\"published\", \"updated\"):\n        v = entry.get(k)\n        if not v:\n            continue\n        try:\n            dt = dtparser.parse(v)\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=timezone.utc)\n            return dt.astimezone(timezone.utc)\n        except Exception:\n            pass\n    return None\n\n\ndef fetch_recent_items(feed_urls: list[str], since_utc: datetime, per_feed_limit: int):\n    items = []\n    failures = []\n\n    for url in feed_urls:\n        parsed, err = safe_parse_feed(url, timeout=FEED_TIMEOUT_SECONDS)\n        if parsed is None:\n            print(f\"[SKIP] {url} -> {err}\")\n            failures.append((url, err))\n            continue\n        if err:\n            print(f\"[WARN] {url} -> {err}\")\n\n        feed_title = getattr(parsed.feed, \"title\", url) if hasattr(parsed, \"feed\") else url\n        entries = getattr(parsed, \"entries\", [])[:per_feed_limit]\n\n        for e in entries:\n            t = entry_time_utc(e)\n            # ← BUG FIX: 没有时间字段的条目跳过，避免旧条目无限重发\n            if not t:\n                continue\n            if t < since_utc:\n                continue\n\n            items.append({\n                \"feed\": str(feed_title),\n                \"title\": e.get(\"title\", \"无标题\"),\n                \"link\": e.get(\"link\", \"\"),\n                \"time\": t.isoformat(),\n            })\n\n    return items, failures\n\n\n# ── HTML 构建 ───────────────────────────────────────────────────\ndef build_html(items, failures):\n    ensure_argos_en_zh_installed()\n\n    parts = []\n    if not items:\n        parts.append(f\"<p>过去 {LOOKBACK_HOURS} 小时没有抓到新的 RSS 条目。</p>\")\n    else:\n        by_feed = {}\n        for it in items:\n            by_feed.setdefault(it[\"feed\"], []).append(it)\n\n        parts.append(\n            f\"<p>每日 RSS 摘要（过去 {LOOKBACK_HOURS} 小时，共 {len(items)} 条）</p>\"\n        )\n        for feed, lst in by_feed.items():\n            parts.append(f\"<h3>{_escape(str(feed))}</h3><ul>\")\n            for it in lst:\n                title_html = _escape(it[\"title\"])  # 标题保留原文\n                link = it[\"link\"]\n                time_s = _escape(it[\"time\"][:10])   # 只显示日期\n                # 全文翻译摘要（标题不翻译）\n                summary = summarize_by_translate(it[\"title\"], it[\"link\"])\n                summary_html = (\n                    f'<br/><small style=\"color:#555\">{_escape(summary)}</small>'\n                    if summary else \"\"\n                )\n                parts.append(\n                    f'<li><a href=\"{_escape(link)}\">{title_html}</a> '\n                    f'<small>({time_s})</small>{summary_html}</li>'\n                )\n            parts.append(\"</ul>\")\n\n    if failures:\n        parts.append(f\"<hr/><p>抓取失败（已跳过）: {len(failures)} 个</p><ul>\")\n        for url, reason in failures[:30]:\n            parts.append(\n                f\"<li><code>{_escape(url)}</code><br/>\"\n                f\"<small>{_escape(str(reason))}</small></li>\"\n            )\n        if len(failures) > 30:\n            parts.append(f\"<li>……省略 {len(failures) - 30} 个</li>\")\n        parts.append(\"</ul>\")\n\n    return \"\\n\".join(parts)\n\n\n# ── 邮件发送 ─────────────────────────────────────────────────────\ndef send_email(html_body: str):\n    smtp_host = os.environ.get(\"SMTP_HOST\")\n    smtp_port = int(os.environ.get(\"SMTP_PORT\", \"465\"))\n    email_user = os.environ[\"EMAIL_USER\"]\n    email_pass = os.environ[\"EMAIL_PASS\"]\n    email_to = os.environ[\"EMAIL_TO\"]\n    subject = os.environ.get(\"EMAIL_SUBJECT\", \"每日 RSS 摘要\")\n\n    msg = MIMEMultipart(\"alternative\")\n    msg[\"Subject\"] = Header(subject, \"utf-8\")\n    msg[\"From\"] = email_user\n    msg[\"To\"] = email_to\n    msg.attach(MIMEText(html_body, \"html\", \"utf-8\"))\n\n    context = ssl_module.create_default_context()\n    if smtp_port == 465:\n        with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=60, context=context) as server:\n            server.login(email_user, email_pass)\n            server.sendmail(email_user, [email_to], msg.as_string())\n    else:\n        with smtplib.SMTP(smtp_host, smtp_port, timeout=60) as server:\n            server.ehlo()\n            server.starttls(context=context)\n            server.ehlo()\n            server.login(email_user, email_pass)\n            server.sendmail(email_user, [email_to], msg.as_string())\n\n\ndef main():\n    feeds = load_feeds_from_opml_file(OPML_PATH)\n    if not feeds:\n        raise RuntimeError(\"feeds.opml 里没有任何 xmlUrl\")\n    print(f\"[INFO] 共加载 {len(feeds)} 个 RSS 源\")\n\n    since = datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)\n    items, failures = fetch_recent_items(feeds, since_utc=since, per_feed_limit=PER_FEED_LIMIT)\n    print(f\"[INFO] 获取到 {len(items)} 条有效条目，{len(failures)} 个失败\")\n\n    if items:\n        print(f\"[INFO] 正在抓取文章全文并翻译（Argos en→zh）…\")\n    html = build_html(items, failures)\n    send_email(html)\n    print(\"[INFO] 邮件已发送\")\n\n\nif __name__ == \"__main__\":\n    main()\n"
+import os
+import ssl
+import smtplib
+import feedparser
+import xml.etree.ElementTree as ET
+import re
+import html
+import ssl as ssl_module
+from datetime import datetime, timezone, timedelta
+from dateutil import parser as dtparser
+from urllib.request import urlopen, Request
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.header import Header
+
+import argostranslate.package
+import argostranslate.translate
+
+
+OPML_PATH = "feeds.opml"
+
+FEED_TIMEOUT_SECONDS = 15
+ARTICLE_TIMEOUT_SECONDS = 20
+PER_FEED_LIMIT = 10
+LOOKBACK_HOURS = 24
+TRANSLATE_SUMMARY_LEN = 300   # 摘要截断字数（中文字符）
+
+
+# ── Argos 翻译（离线缓存） ──────────────────────────────────────
+_translate_cache = {}
+
+
+def ensure_argos_en_zh_installed():
+    try:
+        argostranslate.translate.get_translation_from_codes("en", "zh")
+        return
+    except Exception:
+        pass
+    print("[INFO] 安装 Argos 离线翻译模型（en→zh），首次运行会下载，请稍等…")
+    argostranslate.package.update_package_index()
+    available = argostranslate.package.get_available_packages()
+    pkg = next((p for p in available if p.from_code == "en" and p.to_code == "zh"), None)
+    if not pkg:
+        raise RuntimeError("未找到 Argos en→zh 翻译模型")
+    argostranslate.package.install_from_path(pkg.download())
+    print("[INFO] Argos 翻译模型安装完成")
+
+
+def translate_en_to_zh(text: str) -> str:
+    """英译中，带缓存。"""
+    text = (text or "").strip()
+    if not text:
+        return text
+    if text in _translate_cache:
+        return _translate_cache[text]
+    try:
+        zh = argostranslate.translate.get_translation_from_codes("en", "zh").translate(text)
+    except Exception:
+        zh = text
+    _translate_cache[text] = zh
+    return zh
+
+
+def _escape(s: str) -> str:
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+# ── 文章全文抓取 + 纯文本提取 ───────────────────────────────────
+def _strip_html_tags(text: str) -> str:
+    """去掉 HTML 标签并解码实体字符。"""
+    text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r'<script[^>]*>.*?</script>', '', text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r'<[^>]+>', ' ', text)
+    text = html.unescape(text)
+    text = re.sub(r'[ \t]+', ' ', text)
+    text = re.sub(r'\n\s*\n', '\n\n', text).strip()
+    return text
+
+
+def fetch_article_text(url: str, timeout: int = ARTICLE_TIMEOUT_SECONDS) -> str:
+    """
+    抓取网页，提取纯文本。失败返回空字符串（不阻断流程）。
+    """
+    try:
+        req = Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (compatible; rss-mailer/1.0)"
+        })
+        with urlopen(req, timeout=timeout) as r:
+            raw = r.read()
+        # 检测编码
+        text = raw.decode("utf-8", errors="replace")
+        return _strip_html_tags(text)[:5000]  # 最多取前 5000 字符防过大
+    except Exception as e:
+        print(f"[WARN] fetch_article_text failed: {url} -> {e}")
+        return ""
+
+
+def summarize_by_translate(title: str, link: str) -> str:
+    """
+    抓取文章全文，翻译成中文，截取前 TRANSLATE_SUMMARY_LEN 字作为摘要。
+    标题保留原文不翻译。
+    """
+    article = fetch_article_text(link)
+    if not article:
+        return ""
+    zh = translate_en_to_zh(article)
+    # 按中文字符截断（避免切断单词）
+    if len(zh) <= TRANSLATE_SUMMARY_LEN:
+        return zh
+    # 找最后一个完整的句子断点
+    cut = zh[:TRANSLATE_SUMMARY_LEN]
+    last_punct = max(cut.rfind('。'), cut.rfind('！'), cut.rfind('？'),
+                     cut.rfind('；'), cut.rfind('，'))
+    if last_punct > TRANSLATE_SUMMARY_LEN * 0.6:
+        return cut[:last_punct + 1]
+    return cut + "…"
+
+
+# ── RSS 解析 ────────────────────────────────────────────────────
+def load_feeds_from_opml_file(opml_path: str) -> list[str]:
+    with open(opml_path, "r", encoding="utf-8") as f:
+        content = f.read().strip()
+    root = ET.fromstring(content)
+    seen = set()
+    out = []
+    for node in root.findall(".//outline"):
+        xml_url = node.attrib.get("xmlUrl")
+        if xml_url and xml_url.strip() not in seen:
+            seen.add(xml_url.strip())
+            out.append(xml_url.strip())
+    return out
+
+
+def safe_parse_feed(url: str, timeout: int):
+    try:
+        req = Request(url, headers={"User-Agent": "rss-mailer/1.0"})
+        with urlopen(req, timeout=timeout) as r:
+            data = r.read()
+        parsed = feedparser.parse(data)
+        if getattr(parsed, "bozo", 0):
+            ex = getattr(parsed, "bozo_exception", None)
+            if ex:
+                return parsed, f"bozo_exception: {type(ex).__name__}: {ex}"
+        return parsed, None
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+
+
+def entry_time_utc(entry) -> datetime | None:
+    for k in ("published", "updated"):
+        v = entry.get(k)
+        if not v:
+            continue
+        try:
+            dt = dtparser.parse(v)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            pass
+    return None
+
+
+def fetch_recent_items(feed_urls: list[str], since_utc: datetime, per_feed_limit: int):
+    items = []
+    failures = []
+
+    for url in feed_urls:
+        parsed, err = safe_parse_feed(url, timeout=FEED_TIMEOUT_SECONDS)
+        if parsed is None:
+            print(f"[SKIP] {url} -> {err}")
+            failures.append((url, err))
+            continue
+        if err:
+            print(f"[WARN] {url} -> {err}")
+
+        feed_title = getattr(parsed.feed, "title", url) if hasattr(parsed, "feed") else url
+        entries = getattr(parsed, "entries", [])[:per_feed_limit]
+
+        for e in entries:
+            t = entry_time_utc(e)
+            # ← BUG FIX: 没有时间字段的条目跳过，避免旧条目无限重发
+            if not t:
+                continue
+            if t < since_utc:
+                continue
+
+            items.append({
+                "feed": str(feed_title),
+                "title": e.get("title", "无标题"),
+                "link": e.get("link", ""),
+                "time": t.isoformat(),
+            })
+
+    return items, failures
+
+
+# ── HTML 构建 ───────────────────────────────────────────────────
+def build_html(items, failures):
+    ensure_argos_en_zh_installed()
+
+    parts = []
+    if not items:
+        parts.append(f"<p>过去 {LOOKBACK_HOURS} 小时没有抓到新的 RSS 条目。</p>")
+    else:
+        by_feed = {}
+        for it in items:
+            by_feed.setdefault(it["feed"], []).append(it)
+
+        parts.append(
+            f"<p>每日 RSS 摘要（过去 {LOOKBACK_HOURS} 小时，共 {len(items)} 条）</p>"
+        )
+        for feed, lst in by_feed.items():
+            parts.append(f"<h3>{_escape(str(feed))}</h3><ul>")
+            for it in lst:
+                title_html = _escape(it["title"])  # 标题保留原文
+                link = it["link"]
+                time_s = _escape(it["time"][:10])   # 只显示日期
+                # 全文翻译摘要（标题不翻译）
+                summary = summarize_by_translate(it["title"], it["link"])
+                summary_html = (
+                    f'<br/><small style="color:#555">{_escape(summary)}</small>'
+                    if summary else ""
+                )
+                parts.append(
+                    f'<li><a href="{_escape(link)}">{title_html}</a> '
+                    f'<small>({time_s})</small>{summary_html}</li>'
+                )
+            parts.append("</ul>")
+
+    if failures:
+        parts.append(f"<hr/><p>抓取失败（已跳过）: {len(failures)} 个</p><ul>")
+        for url, reason in failures[:30]:
+            parts.append(
+                f"<li><code>{_escape(url)}</code><br/>"
+                f"<small>{_escape(str(reason))}</small></li>"
+            )
+        if len(failures) > 30:
+            parts.append(f"<li>……省略 {len(failures) - 30} 个</li>")
+        parts.append("</ul>")
+
+    return "\n".join(parts)
+
+
+# ── 邮件发送 ─────────────────────────────────────────────────────
+def send_email(html_body: str):
+    smtp_host = os.environ.get("SMTP_HOST")
+    smtp_port = int(os.environ.get("SMTP_PORT", "465"))
+    email_user = os.environ["EMAIL_USER"]
+    email_pass = os.environ["EMAIL_PASS"]
+    email_to = os.environ["EMAIL_TO"]
+    subject = os.environ.get("EMAIL_SUBJECT", "每日 RSS 摘要")
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = Header(subject, "utf-8")
+    msg["From"] = email_user
+    msg["To"] = email_to
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
+
+    context = ssl_module.create_default_context()
+    if smtp_port == 465:
+        with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=60, context=context) as server:
+            server.login(email_user, email_pass)
+            server.sendmail(email_user, [email_to], msg.as_string())
+    else:
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=60) as server:
+            server.ehlo()
+            server.starttls(context=context)
+            server.ehlo()
+            server.login(email_user, email_pass)
+            server.sendmail(email_user, [email_to], msg.as_string())
+
+
+def main():
+    print("[INFO] RSS Mailer started", flush=True)
+    
+    # 加载 feeds
+    print(f"[INFO] Loading feeds from {OPML_PATH}", flush=True)
+    feed_urls = load_feeds_from_opml_file(OPML_PATH)
+    print(f"[INFO] Loaded {len(feed_urls)} feeds", flush=True)
+    
+    # 计算时间窗口
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)
+    print(f"[INFO] Looking for articles since {cutoff.isoformat()}", flush=True)
+    
+    # 获取文章
+    items, failures = fetch_recent_items(feed_urls, cutoff, PER_FEED_LIMIT)
+    print(f"[INFO] Found {len(items)} new items, {len(failures)} failures", flush=True)
+    
+    # 构建并发送邮件
+    html = build_html(items, failures)
+    send_email(html)
+    print("[INFO] Email sent successfully", flush=True)
+
+
+if __name__ == "__main__":
+    main()
