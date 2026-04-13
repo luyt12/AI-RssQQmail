@@ -13,61 +13,24 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.header import Header
 
-import argostranslate.package
-import argostranslate.translate
+# 移除 Argos 翻译，改用 RSS 自带的 description/summary
+# import argostranslate.package
+# import argostranslate.translate
 
 
 OPML_PATH = "feeds.opml"
 
 FEED_TIMEOUT_SECONDS = 15
-ARTICLE_TIMEOUT_SECONDS = 20
 PER_FEED_LIMIT = 10
 LOOKBACK_HOURS = 24
-TRANSLATE_SUMMARY_LEN = 300   # 摘要截断字数（中文字符）
-
-
-# ── Argos 翻译（离线缓存） ──────────────────────────────────────
-_translate_cache = {}
-
-
-def ensure_argos_en_zh_installed():
-    try:
-        argostranslate.translate.get_translation_from_codes("en", "zh")
-        return
-    except Exception:
-        pass
-    print("[INFO] 安装 Argos 离线翻译模型（en→zh），首次运行会下载，请稍等…")
-    argostranslate.package.update_package_index()
-    available = argostranslate.package.get_available_packages()
-    pkg = next((p for p in available if p.from_code == "en" and p.to_code == "zh"), None)
-    if not pkg:
-        raise RuntimeError("未找到 Argos en→zh 翻译模型")
-    argostranslate.package.install_from_path(pkg.download())
-    print("[INFO] Argos 翻译模型安装完成")
-
-
-def translate_en_to_zh(text: str) -> str:
-    """英译中，带缓存。"""
-    text = (text or "").strip()
-    if not text:
-        return text
-    if text in _translate_cache:
-        return _translate_cache[text]
-    try:
-        zh = argostranslate.translate.get_translation_from_codes("en", "zh").translate(text)
-    except Exception:
-        zh = text
-    _translate_cache[text] = zh
-    return zh
 
 
 def _escape(s: str) -> str:
     return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-# ── 文章全文抓取 + 纯文本提取 ───────────────────────────────────
-def _strip_html_tags(text: str) -> str:
-    """去掉 HTML 标签并解码实体字符。"""
+def strip_html(text: str) -> str:
+    """去除HTML标签，保留纯文本"""
     text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r'<script[^>]*>.*?</script>', '', text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r'<[^>]+>', ' ', text)
@@ -77,46 +40,39 @@ def _strip_html_tags(text: str) -> str:
     return text
 
 
-def fetch_article_text(url: str, timeout: int = ARTICLE_TIMEOUT_SECONDS) -> str:
-    """
-    抓取网页，提取纯文本。失败返回空字符串（不阻断流程）。
-    """
-    try:
-        req = Request(url, headers={
-            "User-Agent": "Mozilla/5.0 (compatible; rss-mailer/1.0)"
-        })
-        with urlopen(req, timeout=timeout) as r:
-            raw = r.read()
-        # 检测编码
-        text = raw.decode("utf-8", errors="replace")
-        return _strip_html_tags(text)[:5000]  # 最多取前 5000 字符防过大
-    except Exception as e:
-        print(f"[WARN] fetch_article_text failed: {url} -> {e}")
-        return ""
-
-
-def summarize_by_translate(title: str, link: str) -> str:
-    """
-    抓取文章全文，翻译成中文，截取前 TRANSLATE_SUMMARY_LEN 字作为摘要。
-    标题保留原文不翻译。
-    """
-    article = fetch_article_text(link)
-    if not article:
-        return ""
-    zh = translate_en_to_zh(article)
-    # 按中文字符截断（避免切断单词）
-    if len(zh) <= TRANSLATE_SUMMARY_LEN:
-        return zh
-    # 找最后一个完整的句子断点
-    cut = zh[:TRANSLATE_SUMMARY_LEN]
+def truncate_text(text: str, max_len: int = 500) -> str:
+    """截断文本到指定长度，在句子边界处截断"""
+    if len(text) <= max_len:
+        return text
+    cut = text[:max_len]
+    # 找最后一个句子结束符
     last_punct = max(cut.rfind('。'), cut.rfind('！'), cut.rfind('？'),
-                     cut.rfind('；'), cut.rfind('，'))
-    if last_punct > TRANSLATE_SUMMARY_LEN * 0.6:
+                     cut.rfind('；'), cut.rfind('，'), cut.rfind('.'))
+    if last_punct > max_len * 0.6:
         return cut[:last_punct + 1]
     return cut + "…"
 
 
-# ── RSS 解析 ────────────────────────────────────────────────────
+def get_entry_summary(entry) -> str:
+    """
+    从 RSS entry 获取摘要/描述，不抓取全文。
+    优先使用 summary，其次是 description，都没有则返回空。
+    """
+    # 尝试各种可能的字段
+    for field in ['summary', 'description', 'content', 'value']:
+        text = entry.get(field)
+        if text:
+            # 如果是 content 字段（可能是列表），取第一个
+            if isinstance(text, list) and len(text) > 0:
+                text = text[0].get('value', '')
+            if isinstance(text, dict):
+                text = text.get('value', '')
+            text = strip_html(text)
+            if len(text) > 50:  # 至少50个字符才算有效摘要
+                return truncate_text(text, 800)
+    return ""
+
+
 def load_feeds_from_opml_file(opml_path: str) -> list[str]:
     with open(opml_path, "r", encoding="utf-8") as f:
         content = f.read().strip()
@@ -179,7 +135,6 @@ def fetch_recent_items(feed_urls: list[str], since_utc: datetime, per_feed_limit
 
         for e in entries:
             t = entry_time_utc(e)
-            # ← BUG FIX: 没有时间字段的条目跳过，避免旧条目无限重发
             if not t:
                 continue
             if t < since_utc:
@@ -190,15 +145,13 @@ def fetch_recent_items(feed_urls: list[str], since_utc: datetime, per_feed_limit
                 "title": e.get("title", "无标题"),
                 "link": e.get("link", ""),
                 "time": t.isoformat(),
+                "summary": get_entry_summary(e),  # 使用 RSS 自带的摘要
             })
 
     return items, failures
 
 
-# ── HTML 构建 ───────────────────────────────────────────────────
 def build_html(items, failures):
-    ensure_argos_en_zh_installed()
-
     parts = []
     if not items:
         parts.append(f"<p>过去 {LOOKBACK_HOURS} 小时没有抓到新的 RSS 条目。</p>")
@@ -213,11 +166,10 @@ def build_html(items, failures):
         for feed, lst in by_feed.items():
             parts.append(f"<h3>{_escape(str(feed))}</h3><ul>")
             for it in lst:
-                title_html = _escape(it["title"])  # 标题保留原文
+                title_html = _escape(it["title"])
                 link = it["link"]
-                time_s = _escape(it["time"][:10])   # 只显示日期
-                # 全文翻译摘要（标题不翻译）
-                summary = summarize_by_translate(it["title"], it["link"])
+                time_s = _escape(it["time"][:10])
+                summary = it.get("summary", "")
                 summary_html = (
                     f'<br/><small style="color:#555">{_escape(summary)}</small>'
                     if summary else ""
@@ -242,7 +194,6 @@ def build_html(items, failures):
     return "\n".join(parts)
 
 
-# ── 邮件发送 ─────────────────────────────────────────────────────
 def send_email(html_body: str):
     smtp_host = os.environ.get("SMTP_HOST")
     smtp_port = int(os.environ.get("SMTP_PORT", "465"))
@@ -274,20 +225,15 @@ def send_email(html_body: str):
 def main():
     print("[INFO] RSS Mailer started", flush=True)
     
-    # 加载 feeds
-    print(f"[INFO] Loading feeds from {OPML_PATH}", flush=True)
     feed_urls = load_feeds_from_opml_file(OPML_PATH)
     print(f"[INFO] Loaded {len(feed_urls)} feeds", flush=True)
     
-    # 计算时间窗口
     cutoff = datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)
     print(f"[INFO] Looking for articles since {cutoff.isoformat()}", flush=True)
     
-    # 获取文章
     items, failures = fetch_recent_items(feed_urls, cutoff, PER_FEED_LIMIT)
     print(f"[INFO] Found {len(items)} new items, {len(failures)} failures", flush=True)
     
-    # 构建并发送邮件
     html = build_html(items, failures)
     send_email(html)
     print("[INFO] Email sent successfully", flush=True)
