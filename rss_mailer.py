@@ -13,9 +13,8 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.header import Header
 
-# 移除 Argos 翻译，改用 RSS 自带的 description/summary
-# import argostranslate.package
-# import argostranslate.translate
+import argostranslate.package
+import argostranslate.translate
 
 
 OPML_PATH = "feeds.opml"
@@ -23,6 +22,40 @@ OPML_PATH = "feeds.opml"
 FEED_TIMEOUT_SECONDS = 15
 PER_FEED_LIMIT = 10
 LOOKBACK_HOURS = 24
+
+# 翻译缓存
+_translate_cache = {}
+
+
+def ensure_argos_en_zh_installed():
+    try:
+        argostranslate.translate.get_translation_from_codes("en", "zh")
+        return
+    except Exception:
+        pass
+    print("[INFO] 安装 Argos 离线翻译模型（en→zh），首次运行会下载，请稍等…")
+    argostranslate.package.update_package_index()
+    available = argostranslate.package.get_available_packages()
+    pkg = next((p for p in available if p.from_code == "en" and p.to_code == "zh"), None)
+    if not pkg:
+        raise RuntimeError("未找到 Argos en→zh 翻译模型")
+    argostranslate.package.install_from_path(pkg.download())
+    print("[INFO] Argos 翻译模型安装完成")
+
+
+def translate_en_to_zh(text: str) -> str:
+    """英译中，带缓存。"""
+    text = (text or "").strip()
+    if not text:
+        return text
+    if text in _translate_cache:
+        return _translate_cache[text]
+    try:
+        zh = argostranslate.translate.get_translation_from_codes("en", "zh").translate(text)
+    except Exception:
+        zh = text
+    _translate_cache[text] = zh
+    return zh
 
 
 def _escape(s: str) -> str:
@@ -45,7 +78,6 @@ def truncate_text(text: str, max_len: int = 500) -> str:
     if len(text) <= max_len:
         return text
     cut = text[:max_len]
-    # 找最后一个句子结束符
     last_punct = max(cut.rfind('。'), cut.rfind('！'), cut.rfind('？'),
                      cut.rfind('；'), cut.rfind('，'), cut.rfind('.'))
     if last_punct > max_len * 0.6:
@@ -58,17 +90,15 @@ def get_entry_summary(entry) -> str:
     从 RSS entry 获取摘要/描述，不抓取全文。
     优先使用 summary，其次是 description，都没有则返回空。
     """
-    # 尝试各种可能的字段
     for field in ['summary', 'description', 'content', 'value']:
         text = entry.get(field)
         if text:
-            # 如果是 content 字段（可能是列表），取第一个
             if isinstance(text, list) and len(text) > 0:
                 text = text[0].get('value', '')
             if isinstance(text, dict):
                 text = text.get('value', '')
             text = strip_html(text)
-            if len(text) > 50:  # 至少50个字符才算有效摘要
+            if len(text) > 50:
                 return truncate_text(text, 800)
     return ""
 
@@ -140,18 +170,25 @@ def fetch_recent_items(feed_urls: list[str], since_utc: datetime, per_feed_limit
             if t < since_utc:
                 continue
 
+            # 获取 RSS 自带的摘要并翻译
+            summary_en = get_entry_summary(e)
+            summary_zh = translate_en_to_zh(summary_en) if summary_en else ""
+
             items.append({
                 "feed": str(feed_title),
                 "title": e.get("title", "无标题"),
                 "link": e.get("link", ""),
                 "time": t.isoformat(),
-                "summary": get_entry_summary(e),  # 使用 RSS 自带的摘要
+                "summary_en": summary_en,
+                "summary_zh": summary_zh,
             })
 
     return items, failures
 
 
 def build_html(items, failures):
+    ensure_argos_en_zh_installed()
+
     parts = []
     if not items:
         parts.append(f"<p>过去 {LOOKBACK_HOURS} 小时没有抓到新的 RSS 条目。</p>")
@@ -169,11 +206,16 @@ def build_html(items, failures):
                 title_html = _escape(it["title"])
                 link = it["link"]
                 time_s = _escape(it["time"][:10])
-                summary = it.get("summary", "")
-                summary_html = (
-                    f'<br/><small style="color:#555">{_escape(summary)}</small>'
-                    if summary else ""
-                )
+                
+                # 显示英文原文 + 中文翻译
+                summary_html = ""
+                if it.get("summary_en"):
+                    en = _escape(it["summary_en"])
+                    zh = _escape(it.get("summary_zh", ""))
+                    summary_html = f'<br/><small style="color:#333">{zh}</small>'
+                    if zh != en:
+                        summary_html += f'<br/><small style="color:#888;font-style:italic">[{en}]</small>'
+                
                 parts.append(
                     f'<li><a href="{_escape(link)}">{title_html}</a> '
                     f'<small>({time_s})</small>{summary_html}</li>'
